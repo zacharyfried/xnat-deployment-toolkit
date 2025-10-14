@@ -1,102 +1,36 @@
-# XNAT Migration Toolkit
+# XNAT Deployment Toolkit
 
-**Debugged and deployed XNAT 1.8.1 neuroimaging platform for a 7TB+ research archive, resolving critical infrastructure failures that blocked 135 users from accessing 6,500+ brain imaging sessions.**
+Spent a week debugging why 135 researchers couldn't access their brain scans after a server migration. Fixed it. Here's how.
 
-## The Challenge
+## What Happened
 
-A production neuroimaging research platform failed during migration to Ubuntu 22.04, leaving researchers unable to access critical brain scan data. The system exhibited multiple cascading failures:
-- Authentication system returning "wrong password" for all 135 users
-- Download functionality producing corrupted 22-byte files instead of gigabyte-sized imaging datasets
-- Database corruption preventing user role assignments
-- Tomcat/Java integration failures with modern systemd
-- ZFS storage pool permission conflicts
+Our neuroimaging lab's XNAT server (7TB of MRI data, 6,500+ scanning sessions) completely broke during an Ubuntu upgrade. Users got "wrong password" errors, downloads produced 22-byte empty files instead of gigabytes of brain scans, and the database was corrupted. The vendor docs were useless.
 
-## The Solution
+## What I Fixed
 
-Through systematic debugging and root cause analysis, I identified and resolved five interconnected issues:
+Started with the authentication system - turns out XNAT loads auth providers alphabetically (seriously?), so `ldap-provider.properties` was hijacking all login attempts before checking the actual user database. Renamed the files to control load order.
 
-1. **Fixed authentication hierarchy** - Discovered XNAT was loading authentication providers alphabetically instead of by configuration priority, causing all logins to fail against the wrong backend
-2. **Restored download functionality** - Traced 22-byte file corruption to missing symlink chain (`/opt/xnat/data → /data/xnat`) that broke Java's file locking mechanism
-3. **Repaired database corruption** - Manually reconstructed user role tables and corrected site URL redirects causing HTTPS loops
-4. **Modernized systemd integration** - Rewrote Tomcat service configuration for proper user isolation and memory management
-5. **Implemented ZFS permissions model** - Designed ownership structure compatible with both XNAT's Java processes and Ubuntu's security model
+But users still couldn't log in. Dug through PostgreSQL and found the user_role table was empty - the migration had wiped all permissions. Manually rebuilt role assignments with SQL inserts.
 
-## Technical Skills Demonstrated
+The download bug was weirder. Files existed, permissions were fine, but every download was exactly 22 bytes. After tracing through the Java stack traces, discovered XNAT hardcodes `/opt/xnat/data` in its file locking mechanism but our data lived in `/data/xnat`. One symlink fixed six hours of debugging.
 
-### Linux System Administration
-- Debugged complex systemd service dependencies and override configurations
-- Traced system calls to identify file permission issues across symlink chains
-- Configured PostgreSQL 12 authentication and connection pooling
-- Managed 7TB+ ZFS storage pools with snapshot-based rollback capability
+Also had to:
+- Rewrite the Tomcat systemd service (Ubuntu 22.04 changed how user isolation works)
+- Fix HTTPS redirect loops by updating database URLs
+- Create missing temp directories that nobody documented
 
-### Application Deployment
-- Deployed Tomcat 9 with custom JVM heap configuration (4GB) for medical imaging workloads
-- Integrated 6 production plugins including DICOM viewers and LDAP authentication
-- Configured dual-authentication system (database + LDAP) for 135 users
+## Tech Stack
 
-### Troubleshooting & Debugging
-- Analyzed multi-gigabyte Tomcat/Java stack traces to identify root causes
-- Correlated authentication logs across 3 systems (XNAT, PostgreSQL, LDAP)
-- Used `strace` and `lsof` to debug file locking issues in production
-- Implemented comprehensive logging strategy for production monitoring
+Built and debugged on: Ubuntu 22.04, PostgreSQL 12, Tomcat 9, Java 8, ZFS storage
 
-### Database Administration
-- Restored PostgreSQL database from 500MB+ dump files
-- Manually repaired corrupted user role assignments via SQL
-- Optimized database configuration for medical imaging metadata (70 projects, 6,547 sessions)
+The deployment script (`deploy.sh`) includes all the fixes I discovered. The troubleshooting guide has the actual commands that saved me.
 
-## Repository Contents
+## Results
 
-### `deploy.sh` - Production Deployment Script
-Complete automation script that deploys XNAT with all discovered fixes:
-- Pre-flight checks for system requirements
-- ZFS dataset creation with proper mount points
-- PostgreSQL installation and configuration
-- Tomcat 9 setup with systemd integration
-- XNAT deployment with critical symlink creation
-- Post-deployment verification suite
+Got everyone back online without losing data. The senior admin who'd been fighting this for three days bought me coffee. Learned the hard way that "working in dev" means nothing when you're dealing with 7TB of production data and symlinks.
 
-### `TROUBLESHOOTING.md` - Production Issues Guide
-Real-world troubleshooting guide covering:
-- Authentication failures and resolution paths
-- Download corruption root causes and fixes
-- Database integrity verification procedures
-- Performance tuning for large imaging datasets
-
-## Impact
-
-- **Restored access** for 135 researchers to 7TB+ of neuroimaging data
-- **Eliminated downtime** by implementing rollback procedures using ZFS snapshots
-- **Prevented data loss** through careful migration preserving 6,547 imaging sessions
-- **Improved reliability** with comprehensive monitoring and diagnostic tooling
-
-## Technologies
-
-`Linux (Ubuntu 22.04)` `PostgreSQL 12` `Tomcat 9` `Java 8` `ZFS` `systemd` `LDAP` `Bash Scripting`
-
-## Usage
-
-While this toolkit documents a specific production migration, the deployment script can be adapted for similar XNAT installations:
-
-```bash
-# Review and customize configuration
-vim deploy.sh
-
-# Run deployment (requires root)
-sudo ./deploy.sh
-
-# Verify installation
-curl http://localhost:8080/xnat/
-```
-
-## Lessons Learned
-
-This project reinforced the importance of:
-- **Systematic debugging** - Each "simple" issue had multiple contributing factors
-- **Production empathy** - Understanding user impact drives better solutions
-- **Documentation discipline** - Detailed notes enabled successful rollback and retry
-- **Testing at scale** - 22-byte files worked in test; 7TB datasets revealed the symlink issue
+If you're hiring someone who can figure out why your app is broken when the logs lie and the docs are wrong, let's talk.
 
 ---
 
-*This toolkit represents real production work completed during a critical system migration. All sensitive information has been redacted while preserving technical accuracy.*
+*Note: Sensitive info redacted. This was real production work at a research institution.*
