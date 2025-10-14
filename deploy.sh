@@ -2,8 +2,8 @@
 ################################################################################
 # XNAT 1.8.1 Production Deployment Script
 # Purpose: Deploy XNAT neuroimaging platform on Ubuntu 22.04 with PostgreSQL/Tomcat
-# Author: Infrastructure Team
-# Version: 1.0
+# Author: Zachary Fried
+# Version: 2.3
 ################################################################################
 
 set -e  # Exit on any error
