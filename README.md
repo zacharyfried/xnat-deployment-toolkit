@@ -1,6 +1,6 @@
 # XNAT Deployment Toolkit
 
-Spent a week debugging why 135 researchers couldn't access their brain scans after a server migration. Fixed it. Here's how.
+Spent a month debugging why 135 researchers couldn't access their brain scans after a server migration. Fixed it. Here's how.
 
 ## What Happened
 
