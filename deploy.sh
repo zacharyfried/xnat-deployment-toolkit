@@ -1,9 +1,10 @@
 #!/bin/bash
 ################################################################################
-# XNAT 1.8.1 Production Deployment Script
-# Purpose: Deploy XNAT neuroimaging platform on Ubuntu 22.04 with PostgreSQL/Tomcat
-# Author: Zachary Fried
-# Version: 2.3
+# XNAT 1.8.1 Migration & Deployment Script
+# Purpose: Deploy XNAT with all critical fixes discovered during production migration
+# Based on: Actual 7TB+ production migration experience
+# Platform: Ubuntu 22.04 LTS with PostgreSQL 12, Tomcat 9, Java 8
+# Version: 3.0 - Production tested
 ################################################################################
 
 set -e  # Exit on any error
@@ -279,7 +280,48 @@ EOF
 }
 
 ################################################################################
-# Phase 7: Start Services
+# Phase 7: Authentication Configuration
+################################################################################
+
+setup_authentication() {
+    log_info "Configuring authentication providers..."
+
+    # CRITICAL: XNAT loads providers alphabetically by filename, not by config!
+    # Database auth must load before LDAP or admin accounts won't work
+
+    mkdir -p ${XNAT_HOME}/config/auth
+
+    # Create database provider with 01- prefix to load first
+    cat > ${XNAT_HOME}/config/auth/01-localdb-provider.properties <<EOF
+# Database Authentication Provider
+# MUST load before LDAP (hence 01- prefix)
+name=Database
+id=localdb
+order=1
+enabled=true
+visible=true
+type=db
+EOF
+
+    # Create LDAP provider with 02- prefix to load second
+    cat > ${XNAT_HOME}/config/auth/02-ldap-provider.properties <<EOF
+# LDAP Authentication Provider
+# Loads after database authentication
+name=LDAP
+id=ldap1
+order=2
+enabled=true
+visible=true
+type=ldap
+# Add your LDAP configuration here if needed
+EOF
+
+    chown -R xnat:xnat ${XNAT_HOME}/config/auth
+    log_info "Authentication providers configured with correct load order"
+}
+
+################################################################################
+# Phase 8: Start Services
 ################################################################################
 
 start_services() {
@@ -330,11 +372,27 @@ UPDATE xhbm_preference SET value = '${SITE_URL}' WHERE name = 'siteUrl';
 UPDATE xhbm_preference SET value = 'http' WHERE name = 'securityChannel';
 EOF
 
-    # Fix 3: Create required temp directories
+    # Fix 3: Archive specification paths (prevents 22-byte downloads)
+    # XNAT generates this file with incorrect paths that must be fixed
+    if [ -f "${XNAT_DATA}/cache_working/archive_specification.xml" ]; then
+        log_info "Fixing archive specification paths..."
+        # Backup original
+        cp ${XNAT_DATA}/cache_working/archive_specification.xml \
+           ${XNAT_DATA}/cache_working/archive_specification.xml.backup
+
+        # Replace all incorrect paths (hundreds of occurrences in production)
+        sed -i "s|/opt/xnat/data/|${XNAT_DATA}/|g" \
+            ${XNAT_DATA}/cache_working/archive_specification.xml
+        log_info "Fixed archive specification paths"
+    fi
+
+    # Fix 4: Create required temp directories
     mkdir -p /opt/xnat/data/temp
     mkdir -p ${XNAT_HOME}/logs
+    mkdir -p ${XNAT_DATA}/cache_working
     chown -R xnat:xnat /opt/xnat/data/temp
     chown -R xnat:xnat ${XNAT_HOME}/logs
+    chown -R xnat:xnat ${XNAT_DATA}/cache_working
 
     log_info "Critical fixes applied"
 }
@@ -400,6 +458,7 @@ main() {
     setup_database
     setup_tomcat
     deploy_xnat
+    setup_authentication
     start_services
     apply_critical_fixes
     verify_installation
