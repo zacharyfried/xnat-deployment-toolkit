@@ -1,296 +1,360 @@
-# XNAT Production Troubleshooting Guide
+# XNAT Troubleshooting Guide
 
-*Real-world issues encountered and resolved during 7TB+ neuroimaging archive migration*
+Real solutions from a 7.5TB production migration with 135 users and 6,547 imaging sessions.
 
-## Critical Issue #1: Authentication Failures
+## Quick Diagnosis
 
-### Symptom
-- All users receive "Wrong username/password" error
-- Logs show successful authentication but login fails
-- Browser remains on login page after correct credentials
-
-### Root Cause
-Multiple authentication providers loading in wrong order, missing user roles in database, incorrect site URL configuration
-
-### Solution
-```bash
-# 1. Check authentication provider order
-ls -la /data/xnat/home/config/auth/
-# Files load alphabetically - rename to control order
-
-# 2. Verify user has assigned role
-sudo -u postgres psql -d xnat
-SELECT u.login, r.role FROM xdat_user u
-LEFT JOIN xhbm_user_role r ON u.login = r.username
-WHERE u.login = 'admin';
-
-# 3. If no role, assign Administrator
-INSERT INTO xhbm_user_role (created, disabled, enabled, timestamp, role, username)
-VALUES (NOW(), '1969-12-31 19:00:00', true, NOW(), 'Administrator', 'admin');
-
-# 4. Fix site URL to prevent HTTPS redirects
-UPDATE xhbm_preference SET value = 'http://your-server:8080' WHERE name = 'siteUrl';
-UPDATE xhbm_preference SET value = 'http' WHERE name = 'securityChannel';
-\q
-
-# 5. Restart Tomcat
-sudo systemctl restart tomcat9
-```
+| Symptom | Likely Cause | Jump To |
+|---------|--------------|---------|
+| Downloads produce 22-byte files | Missing symlink + path issues | [22-Byte Downloads](#critical-issue-22-byte-empty-downloads) |
+| "Authentication successful" but stays on login | 3 separate issues | [Authentication Triple Failure](#critical-issue-authentication-triple-failure) |
+| Browser redirects to HTTPS/production URL | Database has production settings | [HTTPS Redirect Loop](#critical-issue-https-redirect-loop) |
+| XNAT 1.8.10.1 won't deploy | PreResources bug in WAR | [WAR File Bug](#critical-issue-war-file-bug-18101-specific) |
+| Permission denied everywhere | Wrong user + systemd restrictions | [Permission Errors](#critical-issue-permission-errors) |
+| Plugins break on 1.9.2 | Hibernate 5 incompatibility | [Plugin Compatibility](#plugin-compatibility-issues-192) |
 
 ---
 
-## Critical Issue #2: 22-Byte Empty ZIP Downloads
+## Critical Issue: 22-Byte Empty Downloads
 
-### Symptom
-- Download appears to work but ZIP files are only 22 bytes
-- ZIP files cannot be opened (corrupted)
-- Same data downloads fine on old system
+### The Mystery
+Every download produced exactly 22 bytes - just an empty ZIP header. Files existed (7.14TB of them!), permissions were fine, but nothing downloaded. Took 6 hours to solve.
 
-### Root Cause
-Missing symlink prevents Java from creating lock files in archive directory
+### What's Actually Happening
+1. XNAT tries to create lock files (`.scan_catalog.xml.lock`) during downloads
+2. It hardcodes the path `/opt/xnat/data/` for these operations
+3. Your data lives in `/data/xnat/`
+4. Java FileWriter fails with "Read-only file system" (even though it's not read-only)
+5. XNAT generates an empty catalog, creates empty ZIP
 
-### Solution
+### The Fix (Two Parts)
+
+**Part 1: The Critical Symlink**
 ```bash
-# THE CRITICAL FIX - This symlink MUST exist
+# THIS SYMLINK IS MANDATORY - NOT OPTIONAL
 sudo ln -sfn /data/xnat /opt/xnat/data
 
-# Verify symlink is correct
-ls -la /opt/xnat/
+# Verify it exists and points correctly
+ls -la /opt/xnat/data
 # Must show: data -> /data/xnat
-
-# If archive paths are wrong in database, also fix:
-sudo -u postgres psql -d xnat
-UPDATE xdat_resource SET path = REPLACE(path, '/opt/xnat/data/', '/data/xnat/')
-WHERE path LIKE '/opt/xnat/data/%';
-\q
-
-# Restart and test
-sudo systemctl restart tomcat9
 ```
 
----
-
-## Critical Issue #3: Tomcat Fails to Start
-
-### Symptom
-- `systemctl status tomcat9` shows failed
-- Logs show: `java.nio.file.NoSuchFileException: /opt/xnat/data/temp/`
-- Or: Permission denied errors
-
-### Root Cause
-Missing temp directory or wrong ownership
-
-### Solution
+**Part 2: Fix Archive Specification**
 ```bash
-# Create all required directories
-sudo mkdir -p /opt/xnat/data/temp
-sudo mkdir -p /data/xnat/home/logs
-sudo mkdir -p /data/xnat/home/work
+# Wait for XNAT to generate this file first (after initial setup)
+cd /data/xnat/cache_working/
 
-# Fix ownership - MUST be xnat user, not tomcat
-sudo chown -R xnat:xnat /data/xnat/
-sudo chown -R xnat:xnat /opt/xnat/
-sudo chown -R xnat:xnat /var/lib/tomcat9/
-sudo chown -R xnat:xnat /var/log/tomcat9/
+# Check how many wrong paths exist
+grep -c "/opt/xnat/data/" archive_specification.xml
+# In production: 306+ occurrences!
 
-# Restart
-sudo systemctl restart tomcat9
-```
-
----
-
-## Critical Issue #4: Database Connection Failures
-
-### Symptom
-- XNAT shows database connection errors
-- PostgreSQL is running but XNAT cannot connect
-
-### Root Cause
-PostgreSQL authentication not configured for XNAT user
-
-### Solution
-```bash
-# 1. Check PostgreSQL is running
-sudo systemctl status postgresql
-
-# 2. Test connection manually
-PGPASSWORD=yourpass psql -h localhost -U xnat -d xnat -c "SELECT 1;"
-
-# 3. If fails, fix authentication
-sudo nano /etc/postgresql/12/main/pg_hba.conf
-
-# Add these lines:
-local   xnat    xnat    md5
-host    xnat    xnat    127.0.0.1/32    md5
-
-# 4. Restart PostgreSQL
-sudo systemctl restart postgresql
-
-# 5. Verify XNAT config has correct password
-sudo cat /data/xnat/home/config/xnat-conf.properties | grep datasource
-```
-
----
-
-## Critical Issue #5: HTTPS Redirect Loop
-
-### Symptom
-- Browser redirects to https://server:8443/xnat/
-- Connection refused on port 8443
-- Cannot access XNAT interface
-
-### Root Cause
-Database contains HTTPS URLs from production system
-
-### Solution
-```bash
-# Fix in database
-sudo -u postgres psql -d xnat
-
--- Check current values
-SELECT name, value FROM xhbm_preference
-WHERE name IN ('siteUrl', 'securityChannel');
-
--- Update to HTTP
-UPDATE xhbm_preference SET value = 'http://your-server:8080'
-WHERE name = 'siteUrl';
-
-UPDATE xhbm_preference SET value = 'http'
-WHERE name = 'securityChannel';
-
-\q
+# Backup and fix
+sudo cp archive_specification.xml archive_specification.xml.backup
+sudo sed -i 's|/opt/xnat/data/|/data/xnat/|g' archive_specification.xml
 
 # Restart Tomcat
 sudo systemctl restart tomcat9
 ```
 
+### Verification
+Download a scan - should be megabytes/gigabytes, not 22 bytes!
+
 ---
 
-## Performance Issues
+## Critical Issue: Authentication Triple Failure
 
-### High Memory Usage
+### The Problem
+Users got "authentication successful" in logs but remained on login screen. Three separate issues conspired to break login.
+
+### Issue #1: Provider Load Order
+XNAT loads providers **alphabetically by filename**, ignoring config:
+- `ldap1-provider.properties` loads before `localdb-provider.properties`
+- Admin accounts exist in database, not LDAP
+- LDAP tries first, fails, never tries database
+
+**Fix:**
 ```bash
-# Check current heap settings
-ps aux | grep tomcat | grep Xmx
+cd /data/xnat/home/config/auth/
 
-# Adjust in systemd override
-sudo nano /etc/systemd/system/tomcat9.service.d/override.conf
-# Modify: Environment="JAVA_OPTS=-Xms2048m -Xmx8192m ..."
+# Rename to control load order
+mv localdb-provider.properties 01-localdb-provider.properties
+mv ldap1-provider.properties 02-ldap-provider.properties
 
+# Add explicit ordering (belt and suspenders)
+echo "order=1" >> 01-localdb-provider.properties
+echo "order=2" >> 02-ldap-provider.properties
+```
+
+### Issue #2: Missing Role Assignments
+The `xhbm_user_role` table was empty after migration!
+
+**Fix:**
+```bash
+sudo -u postgres psql -d xnat <<EOF
+-- Check current roles
+SELECT * FROM xhbm_user_role WHERE username='admin';
+
+-- Add Administrator role
+INSERT INTO xhbm_user_role
+  (role, username, enabled, timestamp, created, disabled)
+VALUES
+  ('Administrator', 'admin', true, NOW(), NOW(), '1969-12-31 19:00:00');
+EOF
+```
+
+### Issue #3: Wrong Site URL
+Database contained `https://cerebra.nida.nih.gov` (production), causing redirect failures.
+
+**Fix:**
+```bash
+sudo -u postgres psql -d xnat <<EOF
+UPDATE xhbm_preference SET value = 'http://xnat-vm:8080'
+  WHERE name = 'siteUrl';
+UPDATE xhbm_preference SET value = 'http'
+  WHERE name = 'securityChannel';
+EOF
+```
+
+### Success Indicator
+```
+2025-05-28 02:24:14,923 - admin POST Authentication SUCCESS
+2025-05-28 02:24:15,485 - admin GET SCREEN: Index
+```
+
+---
+
+## Critical Issue: HTTPS Redirect Loop
+
+### Symptom
+Browser redirects to `https://cerebra.nida.nih.gov` or `https://localhost:8443`, connection fails.
+
+### Root Cause
+Production database dump contains production URLs and HTTPS security settings.
+
+### Complete Fix
+```bash
+sudo -u postgres psql -d xnat <<EOF
+-- Check current values
+SELECT name, value FROM xhbm_preference
+WHERE name IN ('siteUrl', 'siteURL', 'securityChannel');
+
+-- Fix all URL references
+UPDATE xhbm_preference SET value = 'http://localhost:8080'
+  WHERE name = 'siteUrl';
+UPDATE xhbm_preference SET value = 'http://localhost:8080'
+  WHERE name = 'siteURL';  -- Yes, both cases exist!
+UPDATE xhbm_preference SET value = 'http'
+  WHERE name = 'securityChannel';
+EOF
+
+sudo systemctl restart tomcat9
+```
+
+---
+
+## Critical Issue: WAR File Bug (1.8.10.1 Specific)
+
+### The Problem
+XNAT 1.8.10.1 ships with broken `context.xml`. Uses `PreResources` which loads plugins before app classes, causing deployment failure.
+
+### The Fix
+```bash
+# Extract WAR
+cd /tmp
+mkdir xnat-fix
+cd xnat-fix
+jar xf /path/to/xnat-web-1.8.10.1.war
+
+# Check the problem
+grep "PreResources" META-INF/context.xml
+
+# Fix it
+sed -i 's/PreResources/PostResources/g' META-INF/context.xml
+
+# Repack (note: M flag = no manifest)
+jar cfM /tmp/xnat-web-1.8.10.1-fixed.war .
+
+# Deploy fixed version
+sudo cp /tmp/xnat-web-1.8.10.1-fixed.war /var/lib/tomcat9/webapps/ROOT.war
+sudo chown xnat:xnat /var/lib/tomcat9/webapps/ROOT.war
+sudo systemctl restart tomcat9
+```
+
+### Why This Matters
+- `PreResources`: Plugins load BEFORE app → class conflicts
+- `PostResources`: Plugins load AFTER app → correct behavior
+
+---
+
+## Critical Issue: Permission Errors
+
+### The Problem
+Permission denied errors everywhere, even with correct file permissions.
+
+### Root Cause #1: Wrong User
+MUST use `xnat` user, NOT `tomcat` user!
+
+### Root Cause #2: Systemd Restrictions
+Ubuntu 22.04's systemd restricts filesystem access.
+
+### Complete Fix
+```bash
+# Fix ownership (EVERYTHING must be xnat:xnat)
+sudo chown -R xnat:xnat /data/xnat/
+sudo chown -R xnat:xnat /opt/xnat/
+sudo chown -R xnat:xnat /var/lib/tomcat9/
+sudo chown -R xnat:xnat /var/log/tomcat9/
+sudo chown -R xnat:xnat /var/cache/tomcat9/
+sudo chown -R xnat:xnat /etc/tomcat9/
+
+# Create systemd override
+sudo mkdir -p /etc/systemd/system/tomcat9.service.d/
+sudo cat > /etc/systemd/system/tomcat9.service.d/override.conf <<'EOF'
+[Service]
+User=xnat
+Group=xnat
+ReadWritePaths=/opt/xnat/data/ /data/xnat/
+Environment="JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64"
+Environment="XNAT_HOME=/data/xnat/home"
+EOF
+
+# Apply changes
 sudo systemctl daemon-reload
 sudo systemctl restart tomcat9
 ```
 
-### Slow Database Queries
-```bash
-# Analyze and vacuum PostgreSQL
-sudo -u postgres psql -d xnat
-ANALYZE;
-VACUUM FULL;
-\q
+---
 
-# Check for missing indexes
-sudo -u postgres psql -d xnat
-SELECT schemaname, tablename, indexname
-FROM pg_indexes
-WHERE schemaname = 'public'
-ORDER BY tablename;
-\q
+## Plugin Compatibility Issues (1.9.2)
+
+### What Broke
+Upgrading to XNAT 1.9.2 broke critical plugins due to Hibernate 4→5 upgrade:
+
+1. **Container Service 3.4.3**:
+   - Error: `HHH000474: Ambiguous persistent property methods`
+   - Need: Version 3.6.0+ (not released at time)
+
+2. **OHIF Viewer 3.0.1**:
+   - Need: Version 3.7.0+ (not released at time)
+
+3. **LDAP Auth Plugin**:
+   - ✅ Version 1.1.0 worked!
+
+### Temporary Solution
+```bash
+# Remove incompatible plugins to allow XNAT to start
+cd /data/xnat/home/plugins/
+mv container-service-3.4.3-fat.jar /tmp/
+mv ohif-viewer-3.0.1-XNAT-1.8.0.jar /tmp/
+
+sudo systemctl restart tomcat9
+```
+
+Core XNAT works but without container workflows or web viewing.
+
+---
+
+## Database Migration Issues
+
+### Missing Role Assignments After Restore
+```bash
+# The migration strips roles - fix manually
+sudo -u postgres psql -d xnat <<EOF
+-- Fix admin
+INSERT INTO xhbm_user_role
+  (role, username, enabled, timestamp, created, disabled)
+VALUES
+  ('Administrator', 'admin', true, NOW(), NOW(), '1969-12-31 19:00:00')
+ON CONFLICT DO NOTHING;
+
+-- Check other users
+SELECT u.username, r.role
+FROM xdat_user u
+LEFT JOIN xhbm_user_role r ON u.username = r.username
+ORDER BY u.username;
+EOF
 ```
 
 ---
 
 ## Diagnostic Commands
 
-### Check Service Status
+### The Essential Health Check
 ```bash
-# Quick health check
-sudo systemctl status postgresql tomcat9
+# 1. Services running?
+systemctl status postgresql tomcat9
 
-# Check ports
-sudo ss -tlpn | grep -E '8080|5432'
+# 2. Critical symlink exists?
+ls -la /opt/xnat/data
+# Must show: data -> /data/xnat
 
-# Check disk space
-df -h /data/xnat
+# 3. XNAT responding?
+curl -I http://localhost:8080/
 
-# Check file counts
-find /data/xnat/archive -type f | wc -l
-```
-
-### Monitor Logs
-```bash
-# Tomcat main log
-sudo tail -f /var/log/tomcat9/catalina.out
-
-# XNAT security log
-sudo tail -f /data/xnat/home/logs/security.log
-
-# PostgreSQL log
-sudo tail -f /var/log/postgresql/postgresql-12-main.log
-```
-
-### Test XNAT Endpoints
-```bash
-# Test basic connectivity
-curl -I http://localhost:8080/xnat/
-
-# Test API (requires auth)
+# 4. Can you authenticate?
 curl -u admin:password http://localhost:8080/xnat/data/projects
+
+# 5. Check for errors
+tail -100 /var/log/tomcat9/catalina.out | grep ERROR
+
+# 6. Test download (the real test!)
+# Login and download a scan - should be > 22 bytes!
 ```
 
 ---
 
 ## Emergency Recovery
 
-### Full System Rollback
+### Using ZFS Snapshots (The Lifesaver)
 ```bash
-# If using ZFS snapshots
+# Stop everything
+sudo systemctl stop tomcat9 postgresql
+
+# Rollback to pre-migration snapshots
 sudo zfs rollback tank/xnat_archive@premigration
+sudo zfs rollback tank/xnat_cache@premigration
 sudo zfs rollback tank/xnat_main@premigration
+sudo zfs rollback tank/xnat_prearchive@premigration
 
-# Database restore
+# Restore database
 sudo -u postgres dropdb xnat
-sudo -u postgres createdb xnat
-sudo -u postgres pg_restore -d xnat /backup/xnat_backup.dump
+sudo -u postgres createdb -O xnat xnat
+sudo -u postgres pg_restore -d xnat /backup/xnat_20250511.dump
 
-# Restart services
-sudo systemctl restart postgresql tomcat9
-```
+# Reapply critical fixes
+sudo ln -sfn /data/xnat /opt/xnat/data
 
-### Clear Tomcat Cache
-```bash
-# Stop Tomcat
-sudo systemctl stop tomcat9
-
-# Clear work directory
-sudo rm -rf /var/lib/tomcat9/work/*
-sudo rm -rf /var/lib/tomcat9/webapps/ROOT/
-
-# Redeploy
-sudo cp /data/xnat/build/xnat-web-1.8.1.war /var/lib/tomcat9/webapps/ROOT.war
-sudo chown xnat:xnat /var/lib/tomcat9/webapps/ROOT.war
-
-# Start Tomcat
-sudo systemctl start tomcat9
+# Start services
+sudo systemctl start postgresql tomcat9
 ```
 
 ---
 
 ## Prevention Checklist
 
-Before declaring migration complete:
+Before declaring victory:
 
-- [ ] Test admin login works
-- [ ] Test regular user login works
-- [ ] Download a scan as ZIP (verify size > 1KB)
-- [ ] Open downloaded ZIP and verify contents
-- [ ] Check no HTTPS redirects occurring
-- [ ] Verify all projects are visible
-- [ ] Test DICOM viewer loads images
-- [ ] Check logs for any ERROR messages
-- [ ] Document all custom configurations
-- [ ] Create snapshot/backup of working state
+- [ ] `/opt/xnat/data` symlink exists and points to `/data/xnat`
+- [ ] Admin can login (not just authenticate)
+- [ ] Regular user can login
+- [ ] Download produces real files (not 22 bytes)
+- [ ] No HTTPS redirects happening
+- [ ] All 70 projects visible
+- [ ] All 135 users can authenticate
+- [ ] No ERROR in last 100 lines of catalina.out
+- [ ] Created ZFS snapshot of working state
 
 ---
 
-*This guide is based on actual production issues encountered during XNAT 1.8.1 migration. Each solution has been tested and verified in production.*
+## Key Lessons
+
+1. **The symlink is not optional** - Without `/opt/xnat/data → /data/xnat`, downloads fail
+2. **Three things must align for auth** - Provider order, role assignments, site URL
+3. **Database migrations lose roles** - Always check `xhbm_user_role` table
+4. **XNAT ships with bugs** - The 1.8.10.1 PreResources issue is real
+5. **Plugin ecosystem lags major versions** - 1.9.2 released before plugins ready
+6. **ZFS snapshots save lives** - Used them multiple times during troubleshooting
+
+---
+
+*Every solution here fixed a real problem during an actual 7.5TB production migration. May 28, 2025, 02:24 UTC - the moment it all finally worked.*
