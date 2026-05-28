@@ -4,7 +4,7 @@
 # Purpose: Deploy and upgrade XNAT with all fixes from 7TB+ production migration
 # Platform: Ubuntu 22.04 LTS with PostgreSQL 12, Tomcat 9, Java 8
 # Final Version: XNAT 1.9.2 (fully functional)
-# Based on: Real migration completed May-June 2025
+# Based on: production migration testing and deployment
 ################################################################################
 
 set -e  # Exit on any error

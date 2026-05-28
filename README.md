@@ -1,80 +1,90 @@
-# XNAT Migration Toolkit
+# XNAT Deployment Toolkit
 
-Successfully migrated a 7TB+ neuroimaging platform to new infrastructure. Built and tested on a dedicated VM before production deployment, ensuring zero downtime for researchers.
+Deployment and operations toolkit for migrating XNAT-based research infrastructure with reproducible setup, upgrade, and troubleshooting steps.
 
-## Project Overview
+## Overview
 
-Our research facility needed to migrate their XNAT neuroimaging platform to new infrastructure. XNAT is specialized software for managing MRI and CT scan data with integrated viewing and analysis capabilities. The production system had been running for several years with thousands of imaging sessions across dozens of research projects.
+This repository documents and automates a production-style migration of an XNAT neuroimaging platform to new Linux infrastructure. The work centered on moving a multi-terabyte imaging archive and PostgreSQL-backed XNAT application while preserving researcher access, authentication behavior, and download reliability.
 
-As the Linux administrator, I was responsible for setting up the new environment, migrating all data, and ensuring everything worked perfectly before switching over. I built the entire system on a test VM first, which allowed me to identify and resolve multiple undocumented issues before they could affect any users.
+The migration was validated first on a dedicated VM, then promoted to production only after the major failure modes had been reproduced and fixed. That test-first approach surfaced several undocumented XNAT behaviors around authentication provider order, generated archive paths, Tomcat permissions, and version-specific WAR file compatibility.
 
-## Technical Approach
+## What I Built
 
-The migration involved moving over 7TB of imaging data and a PostgreSQL database with 100+ user accounts to a fresh Ubuntu 22.04 installation. Rather than risk any production impact, I:
+- A Bash deployment script for provisioning XNAT on Ubuntu with PostgreSQL, Tomcat, Java, filesystem layout, and XNAT configuration.
+- A repeatable upgrade path from XNAT 1.8.1 through 1.8.10.1 to 1.9.2.
+- Operational fixes for authentication order, user-role restoration, generated archive paths, Tomcat systemd restrictions, and a version-specific WAR file issue.
+- Troubleshooting documentation for the migration issues that were most likely to break production use.
 
-1. Set up a complete test environment on a new VM
-2. Migrated all data using ZFS snapshots (providing integrity checks and rollback capability)
-3. Systematically identified and resolved configuration issues
-4. Validated everything worked correctly
-5. Only then deployed to production
+## Impact
 
-This approach meant zero downtime and zero user impact. The challenges I encountered and solved during the test phase would have caused significant problems if discovered during a production migration.
+- Migrated a 7TB+ imaging platform to new infrastructure.
+- Validated the migration on a full VM test environment before production cutover.
+- Avoided researcher-facing downtime during production deployment.
+- Preserved core XNAT functionality while documenting plugin compatibility limits for later follow-up.
 
-## Technical Challenges Resolved
-
-### Authentication Configuration
-
-During testing, I discovered that XNAT's authentication system had several non-obvious requirements. The software loads authentication providers alphabetically by filename, not by configuration settings. This meant LDAP providers were being checked before local database providers, which would have prevented admin accounts from working.
-
-Additionally, the database migration process didn't preserve user role assignments, and the migrated database contained URLs pointing to the old production server. I identified these issues in the test environment and built fixes into my deployment process.
-
-### File System Integration
-
-Testing revealed that XNAT hardcodes certain paths in its file operations. Despite our data being properly mounted at `/data/xnat`, the software expected a path at `/opt/xnat/data` for creating lock files during downloads. Without the proper symbolic link, all file downloads would produce empty 22-byte ZIP files.
-
-I also discovered that XNAT's configuration generator created hundreds of incorrect path references that needed to be corrected. Finding this in testing saved significant troubleshooting time.
-
-### Software Compatibility
-
-When testing the upgrade path from 1.8.1 to 1.8.10.1, I found that the official WAR file contained a configuration error. The context.xml specified `PreResources` instead of `PostResources`, which would cause deployment failures in Tomcat 9. I documented the fix and incorporated it into the deployment process.
-
-## Migration Results
-
-The systematic testing approach paid off. When we deployed to production:
-
-- All data migrated successfully (zero loss)
-- Users experienced no downtime
-- Authentication worked immediately
-- File downloads functioned correctly
-- System upgraded cleanly to XNAT 1.9.2
-
-The final production system runs on Ubuntu 22.04 with PostgreSQL 12, Tomcat 9, and Java 8. While some third-party plugins had compatibility issues with 1.9.2, the core XNAT functionality works perfectly with the built-in features meeting all requirements.
+Specific institutional details have been abstracted. Hostnames, credentials, and internal paths are represented with placeholders where appropriate.
 
 ## Repository Contents
 
-This repository contains the automation and documentation I developed during the project:
+```text
+.
+|-- deploy.sh            # Deployment and upgrade automation
+`-- TROUBLESHOOTING.md   # Operational fixes and diagnostics from testing
+```
 
-**deploy.sh** - Production-ready deployment script with all necessary configurations and fixes built in
+## Technical Highlights
 
-**TROUBLESHOOTING.md** - Comprehensive documentation of potential issues and their solutions
+### Authentication
 
-The deployment script incorporates everything I learned during testing:
-- Creates required symbolic links
-- Configures authentication providers correctly
-- Sets proper database parameters
-- Corrects path specifications
-- Handles WAR file modifications for upgrades
+XNAT loads authentication providers alphabetically by filename. The deployment script prefixes database and LDAP provider files so local administrator accounts are checked before LDAP-backed accounts.
 
-## Value Delivered
+### Storage Paths
 
-By thoroughly testing on a VM first, I:
-- Prevented any production downtime
-- Identified issues that weren't documented anywhere
-- Created repeatable deployment process
-- Built institutional knowledge for future migrations
+Testing showed that XNAT can generate or expect `/opt/xnat/data` paths even when the archive is mounted elsewhere. The script creates the required symlink and documents the archive specification update needed to prevent empty ZIP downloads.
 
-The careful preparation meant that when we did the actual production deployment, everything worked on the first try. Researchers never experienced any interruption to their work.
+### Tomcat Permissions
 
----
+The script configures Tomcat to run as the `xnat` user and adds systemd `ReadWritePaths` entries for the XNAT data directories. This avoids filesystem access failures on Ubuntu 22.04.
 
-*Work performed for a research institution. Specific details appropriately abstracted.*
+### Upgrade Compatibility
+
+The migration path includes a fix for an XNAT 1.8.10.1 WAR packaging issue where `PreResources` must be changed to `PostResources` in `META-INF/context.xml` before deployment on Tomcat 9.
+
+## Usage
+
+Review and customize the configuration variables at the top of `deploy.sh` before running anything on a real host:
+
+```bash
+DB_NAME="xnat"
+DB_USER="xnat"
+DB_PASS="CHANGE_ME_STRONG_PASSWORD"
+XNAT_HOME="/data/xnat/home"
+XNAT_DATA="/data/xnat"
+SITE_URL="http://localhost:8080"
+ADMIN_EMAIL="admin@example.org"
+```
+
+Then run the script as root on an Ubuntu 22.04 host:
+
+```bash
+sudo ./deploy.sh
+```
+
+The script offers four modes:
+
+1. Fresh installation
+2. Upgrade existing XNAT 1.8.1 to 1.8.10.1
+3. Upgrade existing XNAT 1.8.10.1 to 1.9.2
+4. Complete migration path from 1.8.1 to 1.9.2
+
+## Safety Notes
+
+- Read the script before running it. It installs packages, creates users, changes Tomcat ownership, writes systemd overrides, and modifies XNAT configuration.
+- Use a test VM before touching production infrastructure.
+- Take filesystem and database backups before any migration or upgrade.
+- Replace all placeholder credentials and URLs.
+- Confirm plugin compatibility before upgrading to XNAT 1.9.x.
+
+## Related Documentation
+
+See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for the specific failure modes found during testing and the commands used to diagnose or fix them.

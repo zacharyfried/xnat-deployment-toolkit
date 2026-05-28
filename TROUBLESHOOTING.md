@@ -1,6 +1,6 @@
 # XNAT Troubleshooting Guide
 
-Real solutions from a 7.5TB production migration with 135 users and 6,547 imaging sessions.
+Operational fixes from a 7TB+ production migration of an XNAT imaging platform.
 
 ## Quick Diagnosis
 
@@ -18,7 +18,7 @@ Real solutions from a 7.5TB production migration with 135 users and 6,547 imagin
 ## Critical Issue: 22-Byte Empty Downloads
 
 ### The Mystery
-Every download produced exactly 22 bytes - just an empty ZIP header. Files existed (7.14TB of them!), permissions were fine, but nothing downloaded. Took 6 hours to solve.
+Every download produced exactly 22 bytes - just an empty ZIP header. Files existed, permissions appeared correct, but nothing downloaded.
 
 ### What's Actually Happening
 1. XNAT tries to create lock files (`.scan_catalog.xml.lock`) during downloads
@@ -46,7 +46,7 @@ cd /data/xnat/cache_working/
 
 # Check how many wrong paths exist
 grep -c "/opt/xnat/data/" archive_specification.xml
-# In production: 306+ occurrences!
+# Large deployments may contain hundreds of generated path references.
 
 # Backup and fix
 sudo cp archive_specification.xml archive_specification.xml.backup
@@ -103,12 +103,12 @@ EOF
 ```
 
 ### Issue #3: Wrong Site URL
-Database contained `https://cerebra.nida.nih.gov` (production), causing redirect failures.
+Database contained the old production `siteUrl`, causing redirect failures.
 
 **Fix:**
 ```bash
 sudo -u postgres psql -d xnat <<EOF
-UPDATE xhbm_preference SET value = 'http://xnat-vm:8080'
+UPDATE xhbm_preference SET value = 'http://xnat-vm.example.org:8080'
   WHERE name = 'siteUrl';
 UPDATE xhbm_preference SET value = 'http'
   WHERE name = 'securityChannel';
@@ -117,8 +117,8 @@ EOF
 
 ### Success Indicator
 ```
-2025-05-28 02:24:14,923 - admin POST Authentication SUCCESS
-2025-05-28 02:24:15,485 - admin GET SCREEN: Index
+YYYY-MM-DD HH:MM:SS - admin POST Authentication SUCCESS
+YYYY-MM-DD HH:MM:SS - admin GET SCREEN: Index
 ```
 
 ---
@@ -126,7 +126,7 @@ EOF
 ## Critical Issue: HTTPS Redirect Loop
 
 ### Symptom
-Browser redirects to `https://cerebra.nida.nih.gov` or `https://localhost:8443`, connection fails.
+Browser redirects to an old production hostname or `https://localhost:8443`, connection fails.
 
 ### Root Cause
 Production database dump contains production URLs and HTTPS security settings.
@@ -292,7 +292,7 @@ ls -la /opt/xnat/data
 curl -I http://localhost:8080/
 
 # 4. Can you authenticate?
-curl -u admin:password http://localhost:8080/xnat/data/projects
+curl -u admin:REPLACE_WITH_PASSWORD http://localhost:8080/xnat/data/projects
 
 # 5. Check for errors
 tail -100 /var/log/tomcat9/catalina.out | grep ERROR
@@ -319,7 +319,7 @@ sudo zfs rollback tank/xnat_prearchive@premigration
 # Restore database
 sudo -u postgres dropdb xnat
 sudo -u postgres createdb -O xnat xnat
-sudo -u postgres pg_restore -d xnat /backup/xnat_20250511.dump
+sudo -u postgres pg_restore -d xnat /backup/xnat_backup.dump
 
 # Reapply critical fixes
 sudo ln -sfn /data/xnat /opt/xnat/data
@@ -339,8 +339,8 @@ Before declaring victory:
 - [ ] Regular user can login
 - [ ] Download produces real files (not 22 bytes)
 - [ ] No HTTPS redirects happening
-- [ ] All 70 projects visible
-- [ ] All 135 users can authenticate
+- [ ] Expected projects visible
+- [ ] Expected users can authenticate
 - [ ] No ERROR in last 100 lines of catalina.out
 - [ ] Created ZFS snapshot of working state
 
@@ -357,4 +357,4 @@ Before declaring victory:
 
 ---
 
-*Every solution here fixed a real problem during an actual 7.5TB production migration. May 28, 2025, 02:24 UTC - the moment it all finally worked.*
+*Every solution here fixed a real problem during an actual production migration. Institutional details have been abstracted.*
